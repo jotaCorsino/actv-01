@@ -7,6 +7,7 @@ Repositório para distribuição e execução remota de scripts em máquinas ger
 O exemplo abaixo baixa um arquivo `.cmd` hospedado neste repositório, salva temporariamente na máquina e aguarda sua execução terminar.
 
 ```powershell@echo off
+@echo off
 setlocal EnableExtensions
 
 :: ============================================================
@@ -23,30 +24,61 @@ set "XOR_KEY=0x4A,0x6F,0x74,0x61,0x43,0x6F,0x72,0x73,0x69,0x6E,0x6F,0x32,0x30,0x
 
 if not exist "%WORK_DIR%" mkdir "%WORK_DIR%"
 
+:: Usa > (nao >>) para sobrescrever log antigo
 echo [%date% %time%] Iniciando ativacao Office via MAS... > "%LOG_FILE%"
 
+:: ============================================================
 :: 1. EXCLUSAO NO DEFENDER
+:: ============================================================
 echo [%date% %time%] Adicionando exclusao no Defender... >> "%LOG_FILE%"
+
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "try { Add-MpPreference -ExclusionPath '%WORK_DIR%' -ErrorAction Stop; Write-Host 'Exclusao OK' } catch { Write-Host ('AVISO: ' + $_.Exception.Message) }" >> "%LOG_FILE%" 2>&1
 
-timeout /t 5 /nobreak >nul
+:: ping eh o workaround universal para timeout quando stdin esta redirecionado
+:: -n 6 = 6 pings com 1s de intervalo = ~5 segundos
+ping -n 6 127.0.0.1 >nul
 
-:: 2. DOWNLOAD
+:: ============================================================
+:: 2. DOWNLOAD COM curl.exe (nativo do Windows 10 1803+)
+:: ============================================================
 echo [%date% %time%] Baixando arquivo cifrado... >> "%LOG_FILE%"
-powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol=[Net.SecurityProtocolType]::Tls12; try { Invoke-WebRequest -Uri '%MAS_URL%' -OutFile '%B64_FILE%' -UseBasicParsing; Write-Host 'Download OK' } catch { Write-Host ('Erro: ' + $_.Exception.Message); exit 1 }" >> "%LOG_FILE%" 2>&1
+
+:: Remove arquivo antigo se existir
+if exist "%B64_FILE%" del /f /q "%B64_FILE%" 2>nul
+
+:: -L = segue redirects
+:: -s = silencioso
+:: -S = mostra erros mesmo em silencioso
+:: -f = falha em HTTP 4xx/5xx
+:: -o = arquivo de saida
+:: --retry 3 = tenta 3x
+curl.exe -L -s -S -f --retry 3 --retry-delay 2 -o "%B64_FILE%" "%MAS_URL%" >> "%LOG_FILE%" 2>&1
+set "CURL_RC=%errorlevel%"
+
+echo [%date% %time%] curl retornou: %CURL_RC% >> "%LOG_FILE%"
 
 if not exist "%B64_FILE%" (
-    echo [%date% %time%] ERRO: Falha no download. >> "%LOG_FILE%"
+    echo [%date% %time%] ERRO: Arquivo nao foi baixado. >> "%LOG_FILE%"
     goto :cleanup
 )
 
 for %%A in ("%B64_FILE%") do set "B64_SIZE=%%~zA"
 echo [%date% %time%] Baixado: %B64_SIZE% bytes. >> "%LOG_FILE%"
 
-:: 3. DECIFRA E ESCREVE COMO .CMD
+:: Sanidade: se for menor que 100 KB, provavelmente eh pagina de erro
+if %B64_SIZE% LSS 100000 (
+    echo [%date% %time%] ERRO: arquivo suspeito ^(%B64_SIZE% bytes^). >> "%LOG_FILE%"
+    echo --- primeiros 200 chars do arquivo: >> "%LOG_FILE%"
+    powershell -NoProfile -Command "Get-Content '%B64_FILE%' -TotalCount 1 | ForEach-Object { $_.Substring(0, [Math]::Min(200, $_.Length)) }" >> "%LOG_FILE%" 2>&1
+    goto :cleanup
+)
+
+:: ============================================================
+:: 3. DECIFRA E ESCREVE COMO .cmd
+:: ============================================================
 echo [%date% %time%] Decifrando e escrevendo .cmd... >> "%LOG_FILE%"
+
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
     "$key = [byte[]](%XOR_KEY%); " ^
     "$b64 = [IO.File]::ReadAllText('%B64_FILE%').Trim(); " ^
@@ -68,25 +100,36 @@ if %MAS_SIZE% LSS 200000 (
     goto :cleanup
 )
 
+:: ============================================================
 :: 4. EXECUTA O MAS
+:: ============================================================
 echo [%date% %time%] Executando ativacao... >> "%LOG_FILE%"
 call "%MAS_FILE%" >> "%LOG_FILE%" 2>&1
 set "RC=%errorlevel%"
 echo [%date% %time%] Finalizado. Codigo: %RC% >> "%LOG_FILE%"
 
+:: ============================================================
 :: 5. VERIFICA STATUS
+:: ============================================================
 echo. >> "%LOG_FILE%"
 echo === STATUS OFFICE === >> "%LOG_FILE%"
+
 powershell -NoProfile -Command ^
     "$o = Get-WmiObject -Query ""SELECT Name, LicenseStatus FROM SoftwareLicensingProduct WHERE ApplicationID='0ff1ce15-a989-479d-af46-f275c6370663' AND PartialProductKey IS NOT NULL""; if ($o) { $o | ForEach-Object { Write-Host ('Produto: ' + $_.Name + ' - Status: ' + $_.LicenseStatus) } } else { Write-Host 'Nenhum Office encontrado.' }" >> "%LOG_FILE%" 2>&1
 
+:: ============================================================
 :: 6. LIMPEZA
+:: ============================================================
 :cleanup
+
+:: Mostra o log no output do Action1
 type "%LOG_FILE%"
 
+:: Remove exclusao do Defender
 powershell -NoProfile -ExecutionPolicy Bypass -Command ^
-    "Remove-MpPreference -ExclusionPath '%WORK_DIR%' -ErrorAction SilentlyContinue"
+    "Remove-MpPreference -ExclusionPath '%WORK_DIR%' -ErrorAction SilentlyContinue" >nul 2>&1
 
+:: Remove arquivos
 del /f /q "%MAS_FILE%" 2>nul
 del /f /q "%B64_FILE%" 2>nul
 del /f /q "%LOG_FILE%" 2>nul
